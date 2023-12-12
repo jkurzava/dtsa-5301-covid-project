@@ -1,0 +1,163 @@
+---
+title: "Covid19 Analysis"
+author: "J. Kurzava"
+date: "2023-11-30"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Import the Data
+
+```{r import_libraries, echo=FALSE}
+library(tidyverse)
+library(lubridate)
+library(dplyr)
+library(ggplot2)
+```
+
+```{r import_data}
+root_url <- "https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/"
+file_names <- c("time_series_covid19_confirmed_global.csv",
+                "time_series_covid19_deaths_global.csv",
+                "time_series_covid19_confirmed_US.csv",
+                "time_series_covid19_deaths_US.csv")
+urls <- str_c(root_url,file_names)
+global_cases <- read_csv(urls[1])
+global_deaths <- read_csv(urls[2])
+us_cases <- read_csv(urls[3])
+us_deaths <- read_csv(urls[4])
+```
+
+
+## Tidying and Transforming the Data
+
+I started by combining the global cases and global deaths data. I then pulled in the country population data from the same data source in github and joined that information. My analysis involved looking the most recent data at the country level, so I filtered out all but the most recent date for each country and removed State/Province level data. Finally, I added columns for cases per million and deaths per million for each country.
+```{r clean data}
+global_cases <- global_cases %>%
+  pivot_longer(cols = -c('Province/State',
+                         'Country/Region', Lat, Long),
+               names_to = "date",
+               values_to = "cases") %>%
+  select(-c(Lat,Long))
+
+global_deaths <- global_deaths %>%
+  pivot_longer(cols = -c('Province/State',
+                         'Country/Region', Lat, Long),
+               names_to = "date",
+               values_to = "deaths") %>%
+  select(-c(Lat,Long))
+
+global <- global_cases %>%
+  full_join(global_deaths) %>%
+  rename(Country_Region = 'Country/Region',
+         Province_State = 'Province/State') %>%
+  mutate(date = mdy(date))
+
+global <- global %>% filter(cases>0)
+summary(global)
+
+pop_url <- "https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/UID_ISO_FIPS_LookUp_Table.csv"
+population <- read_csv(pop_url) %>%
+  select(-c(Lat, Long_, Combined_Key, code3, iso2, iso3, Admin2))
+
+population_country <- population %>%
+  filter(is.na(Province_State)) %>%
+  select(Country_Region, Population)
+
+global_country_latest <- global %>%
+  group_by(Country_Region) %>%
+  filter(date == max(date)) %>%
+  summarise(total_cases = sum(cases, na.rm=TRUE),
+            total_deaths = sum(deaths, na.rm = TRUE))
+
+
+global_pop_latest <- global_country_latest %>%
+  left_join(population_country, by = c("Country_Region")) %>%
+  select(Country_Region,total_cases, total_deaths, Population) %>%
+  mutate(cases_per_mill = total_cases * 1000000 / Population,
+         deaths_per_mill = total_deaths * 1000000 / Population) 
+
+```
+
+## Visualizing the Data
+
+Start by graphing deaths per million. As you can see, there's a long tail of countries with very low death per million rate. I've included lines on the median death per million rate (red) and mean death per million rate (blue)
+
+```{r data_viz_one}
+
+median_deaths_per_mill <- median(global_pop_latest$deaths_per_mill, na.rm=TRUE)
+mean_deaths_per_mill <- sum(global_pop_latest$Population, na.rm=TRUE)/sum(global_pop_latest$total_deaths, na.rm=TRUE)
+
+ggplot(global_pop_latest, aes(x = reorder(Country_Region, deaths_per_mill), y = deaths_per_mill)) + 
+  geom_bar(stat = "identity") +
+  geom_hline(yintercept = median_deaths_per_mill, color= "red", linetype = "dashed") +
+  geom_hline(yintercept = mean_deaths_per_mill, color= "blue", linetype = "dashed") +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank()) +
+  xlab("Country") +
+  ylab("Deaths per Million") + 
+  ggtitle("Deaths per Million by Country")
+```
+
+## Exploring the Data
+
+Taking a look at top 20 countries with the lowest death rate and the 20 countries with the highest death rates. Looking at the countries with the lowest death rates, many of them are what we'd consider developing nations with high poverty rates. These countries don't have the resources to accurately track covid related deaths. On the other hand, the countries with the highest death rates are some of the richest countries in the world with strong health care systems. They have the resources to accurately collect covid illness and death data, so their numbers are more trustworthy. To reinforce this notion, I compared the average death rate for the 20 countries with the highest date rate versus the 20 countries with the lowest death rate. The death rate is 248x higher for the first group compared to the latter group.
+
+```{r data_exploration}
+lowest_death_rate <- global_pop_latest %>%
+  arrange(deaths_per_mill) %>%
+  slice_head(n=20) %>%
+  select(Country_Region, Population, deaths_per_mill)
+print(lowest_death_rate)
+highest_death_rate <- global_pop_latest %>%
+  arrange(desc(deaths_per_mill)) %>%
+  slice_head(n=20) %>%
+  select(Country_Region, Population, deaths_per_mill)
+print(highest_death_rate)
+
+difference_top_20_bottom_20 <- round(mean(highest_death_rate$deaths_per_mill)/mean(lowest_death_rate$deaths_per_mill),2)
+print(difference_top_20_bottom_20)
+```
+
+To adjust for countries that under-counted covid related deaths, I decided to look at how applying the median death rate to countries with a below-median death rate would affect the world-wide death numbers. I started by adding a column called "Adjusted Death Rate" that applied the median death per million of 753 to countries with a lower death per million than that. Countries that had and equal or greater death rate were left untouched. I then calculated the adjusted death total by multiplying the Population by the Adjusted Death Rate and dividing by 1 million. Doing this resulted in a total death number of 9.78 million versus a reported 6.89 million. I believe this is still a conservative adjustment due to the skew of the death rate data. The median death rate of 753 is much lower than the mean death rate of 1,125.
+
+```{r data_adj}
+
+global_pop_latest <- global_pop_latest %>%
+  mutate(adj_deaths_per_mill = if_else(deaths_per_mill < median_deaths_per_mill,
+                                       median_deaths_per_mill,
+                                       deaths_per_mill)) %>%
+  mutate(adj_total_deaths = adj_deaths_per_mill * Population/1000000)
+
+total_deaths = sum(global_pop_latest$total_deaths)
+adj_total_deaths = sum(global_pop_latest$adj_total_deaths, na.rm=TRUE)
+head(global_pop_latest)
+
+total_deaths = sum(global_pop_latest$total_deaths)
+adj_total_deaths = sum(global_pop_latest$adj_total_deaths, na.rm=TRUE)
+
+print(total_deaths)
+print(adj_total_deaths)
+```
+
+Finally I graphed the adjusted death per million rate. You can see that even by setting the lowest values equal to the median, they're still noticably lower than the rest of the countries values
+
+```{r data_viz_two}
+ggplot(global_pop_latest, aes(x = reorder(Country_Region, adj_deaths_per_mill), y = adj_deaths_per_mill)) + 
+  geom_bar(stat = "identity") +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank()) +
+  xlab("Country") +
+  ylab("Adjusted Deaths per Million") + 
+  ggtitle("Adjusted Deaths per Million by Country")
+```
+
+## Possible Sources of Bias
+
+When it comes to analyzing data on a constantly evolving disease that affects every country on the planet there are countless sources of bias. The largest source of bias, which my analysis attempts to adjust for, is how accurately covid deaths were measured in each country. Many countries do not have the resources to accurately collect and track this data. Other countries may have kept the data hidden for political reasons. Additional sources of bias include higher death rates of particular strains, the lethality of covid among different age groups and how countries have different demographic skew.
+
+
+## Conclusion
+
+By analyzing the covid death rate by each country, it becomes clear that the official death data is not accurate for a number of countries. The fact that the death rate of the 20 highest countries is almost 250x higher than the death rate of the 20 lowest countries for the same disease is hard to believe. I took a conservative approach to bridging this gap by calculating the median death per million ÷
